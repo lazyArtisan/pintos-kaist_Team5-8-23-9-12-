@@ -5,50 +5,47 @@
 #include <stdbool.h>
 
 /* A counting semaphore. */
-struct semaphore
-{
-	unsigned value;		 /* Current value. */
-	struct list waiters; /* List of waiting threads. */
+struct semaphore {
+	unsigned value;             /* Current value. */
+	struct list waiters;        /* List of waiting threads. */
+	int priority;
 };
+
+void sema_init (struct semaphore *, unsigned value);
+void sema_down (struct semaphore *);
+bool sema_try_down (struct semaphore *);
+void sema_up (struct semaphore *);
+void sema_self_test (void);
+
+bool sema_priority_compare(const struct list_elem *, const struct list_elem *, void *);
 
 /* Lock. */
-struct lock
-{
-	struct thread *holder;		/* Thread holding lock (for debugging). */
+struct lock {
+	struct thread *holder;      /* Thread holding lock (for debugging). */
 	struct semaphore semaphore; /* Binary semaphore controlling access. */
-	struct list_elem elem;		/* List element. */
-	int priority_to_donate;		/* 내가 갖고 있는 waiter 안에 있는 쓰레드들과 holder의 쓰레드를 비교하여 최대의 값 */
 };
 
-void sema_init(struct semaphore *, unsigned value);
-void sema_down(struct semaphore *sema);
-bool sema_try_down(struct semaphore *);
-void sema_up(struct semaphore *);
-void sema_self_test(void);
-
-void lock_init(struct lock *);
-void lock_acquire(struct lock *);
-bool lock_try_acquire(struct lock *);
-void lock_release(struct lock *);
-bool lock_held_by_current_thread(const struct lock *);
-void update_priority(int, struct thread *);
+void lock_init (struct lock *);
+void lock_acquire (struct lock *);
+bool lock_try_acquire (struct lock *);
+void lock_release (struct lock *);
+bool lock_held_by_current_thread (const struct lock *);
 
 /* Condition variable. */
-struct condition
-{
-	struct list waiters; /* List of waiting threads. */
+struct condition {
+	struct list waiters;        /* List of waiting threads. */
 };
 
-void cond_init(struct condition *);
-void cond_wait(struct condition *, struct lock *);
-void cond_signal(struct condition *, struct lock *);
-void cond_broadcast(struct condition *, struct lock *);
+void cond_init (struct condition *);
+void cond_wait (struct condition *, struct lock *);
+void cond_signal (struct condition *, struct lock *);
+void cond_broadcast (struct condition *, struct lock *);
 
 /* Optimization barrier.
  *
  * The compiler will not reorder operations across an
  * optimization barrier.  See "Optimization Barriers" in the
  * reference guide for more information.*/
-#define barrier() asm volatile("" : : : "memory")
+#define barrier() asm volatile ("" : : : "memory")
 
 #endif /* threads/synch.h */

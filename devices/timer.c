@@ -7,7 +7,6 @@
 #include "threads/io.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
-#include <list.h>
 
 /* See [8254] for hardware details of the 8254 timer chip. */
 
@@ -26,204 +25,198 @@ static int64_t ticks;
 static unsigned loops_per_tick;
 
 static intr_handler_func timer_interrupt;
-static bool too_many_loops(unsigned loops);
-static void busy_wait(int64_t loops);
-static void real_time_sleep(int64_t num, int32_t denom);
+static bool too_many_loops (unsigned loops);
+static void busy_wait (int64_t loops);
+static void real_time_sleep (int64_t num, int32_t denom);
+
+static struct list waiting_list;
+
+struct sleep_thread{
+	struct thread *t;
+	int64_t tick_to_wake_up;
+	struct list_elem elem;
+};
 
 /* Sets up the 8254 Programmable Interval Timer (PIT) to
    interrupt PIT_FREQ times per second, and registers the
    corresponding interrupt. */
-void timer_init(void)
-{
+void
+timer_init (void) {
 	/* 8254 input frequency divided by TIMER_FREQ, rounded to
 	   nearest. */
 	uint16_t count = (1193180 + TIMER_FREQ / 2) / TIMER_FREQ;
 
-	outb(0x43, 0x34); /* CW: counter 0, LSB then MSB, mode 2, binary. */
-	outb(0x40, count & 0xff);
-	outb(0x40, count >> 8);
+	outb (0x43, 0x34);    /* CW: counter 0, LSB then MSB, mode 2, binary. */
+	outb (0x40, count & 0xff);
+	outb (0x40, count >> 8);
 
-	intr_register_ext(0x20, timer_interrupt, "8254 Timer");
+	list_init(&waiting_list);
+
+	intr_register_ext (0x20, timer_interrupt, "8254 Timer");
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
-void timer_calibrate(void)
-{
+void
+timer_calibrate (void) {
 	unsigned high_bit, test_bit;
 
-	ASSERT(intr_get_level() == INTR_ON);
-	printf("Calibrating timer...  ");
+	ASSERT (intr_get_level () == INTR_ON);
+	printf ("Calibrating timer...  ");
 
 	/* Approximate loops_per_tick as the largest power-of-two
 	   still less than one timer tick. */
 	loops_per_tick = 1u << 10;
-	while (!too_many_loops(loops_per_tick << 1))
-	{
+	while (!too_many_loops (loops_per_tick << 1)) {
 		loops_per_tick <<= 1;
-		ASSERT(loops_per_tick != 0);
+		ASSERT (loops_per_tick != 0);
 	}
 
 	/* Refine the next 8 bits of loops_per_tick. */
 	high_bit = loops_per_tick;
 	for (test_bit = high_bit >> 1; test_bit != high_bit >> 10; test_bit >>= 1)
-		if (!too_many_loops(high_bit | test_bit))
+		if (!too_many_loops (high_bit | test_bit))
 			loops_per_tick |= test_bit;
 
-	printf("%'" PRIu64 " loops/s.\n", (uint64_t)loops_per_tick * TIMER_FREQ);
+	printf ("%'"PRIu64" loops/s.\n", (uint64_t) loops_per_tick * TIMER_FREQ);
 }
 
 /* Returns the number of timer ticks since the OS booted. */
 int64_t
-timer_ticks(void)
-{
-	enum intr_level old_level = intr_disable();
+timer_ticks (void) {
+	enum intr_level old_level = intr_disable ();
 	int64_t t = ticks;
-	intr_set_level(old_level);
-	barrier();
+	intr_set_level (old_level);
+	barrier ();
 	return t;
 }
 
 /* Returns the number of timer ticks elapsed since THEN, which
    should be a value once returned by timer_ticks(). */
 int64_t
-timer_elapsed(int64_t then)
-{
-	return timer_ticks() - then;
+timer_elapsed (int64_t then) {
+	return timer_ticks () - then;
 }
 
-bool for_ascending_sleep_time(const struct list_elem *a, const struct list_elem *b, void *aux)
-{
-	int ap = list_entry(a, struct thread, elem)->sleep_ticks;
-	int bp = list_entry(b, struct thread, elem)->sleep_ticks;
-	return ap < bp;
-}
+
+
+
 
 /* Suspends execution for approximately TICKS timer ticks. */
-void timer_sleep(int64_t ticks)
-{
-	extern struct list sleeping_list;
-	struct thread *sleeping_thread = thread_current();
+void
+timer_sleep (int64_t ticks) {
 
-	sleeping_thread->sleep_ticks = timer_ticks() + ticks;
+	/*
+	// busy_wait 방식 
+	// start에서 현재의 timer_tick(boot~지금까지의 tick 수)을 받아 저장한다.
+	int64_t start = timer_ticks ();
 
-	// list_insert_ordered(&sleeping_list, &(sleeping_thread->elem), for_ascending_sleep_time, NULL); // 명부에 정보 전달
-	list_push_back(&sleeping_list, &(sleeping_thread->elem)); // 명부에 정보 전달
+	// interrupt가 나면 ASSERT
+	ASSERT (intr_get_level () == INTR_ON);
 
-	enum intr_level old_level = intr_disable();
-	thread_block(); // 드르렁. 명부에서 자기 이름 나오면 딱 1번 깨서 마저 실행.
-	intr_set_level(old_level);
+	// start부터 지금까지의 tick 수가 ticks 보다 작으면 계속 yield
+	while (timer_elapsed (start) < ticks)
+		thread_yield ();
+
+	*/
+
+	int64_t start = timer_ticks();
+    int64_t wakeup = start + ticks;
+
+    struct sleep_thread st;
+
+    ASSERT(intr_get_level() == INTR_ON);
+
+    st.t = thread_current();
+    st.tick_to_wake_up = wakeup;
+
+    enum intr_level old_level = intr_disable();  // 인터럽트를 비활성화하여 원자성을 보장
+
+    struct list_elem *e;
+    for (e = list_begin(&waiting_list); e != list_end(&waiting_list); e = list_next(e)) {
+        struct sleep_thread st_iter = *list_entry(e, struct sleep_thread, elem);
+        if (st_iter.tick_to_wake_up > wakeup) {
+            break;
+        }
+    }
+    list_insert(e, &(st.elem));
+
+    thread_block();  // 스레드 블록
+
+    intr_set_level(old_level);  // 이전 인터럽트 상태로 복원
 }
 
 /* Suspends execution for approximately MS milliseconds. */
-void timer_msleep(int64_t ms)
-{
-	real_time_sleep(ms, 1000);
+void
+timer_msleep (int64_t ms) {
+	real_time_sleep (ms, 1000);
 }
 
 /* Suspends execution for approximately US microseconds. */
-void timer_usleep(int64_t us)
-{
-	real_time_sleep(us, 1000 * 1000);
+void
+timer_usleep (int64_t us) {
+	real_time_sleep (us, 1000 * 1000);
 }
 
 /* Suspends execution for approximately NS nanoseconds. */
-void timer_nsleep(int64_t ns)
-{
-	real_time_sleep(ns, 1000 * 1000 * 1000);
+void
+timer_nsleep (int64_t ns) {
+	real_time_sleep (ns, 1000 * 1000 * 1000);
 }
 
 /* Prints timer statistics. */
-void timer_print_stats(void)
-{
-	printf("Timer: %" PRId64 " ticks\n", timer_ticks());
+void
+timer_print_stats (void) {
+	printf ("Timer: %"PRId64" ticks\n", timer_ticks ());
 }
-
+
 /* Timer interrupt handler. */
 static void
-timer_interrupt(struct intr_frame *args UNUSED)
-{
+timer_interrupt (struct intr_frame *args UNUSED) {
 	ticks++;
-	thread_tick();
+    thread_tick();
 
-	// while (!list_empty(&sleeping_list))
-	// {
-	// 	// struct list_elem *front = list_front(&sleeping_list);
-	// 	struct thread *th = list_entry(list_front(&sleeping_list), struct thread, elem);
-	// 	// struct thread *sleeping_thread = list_entry(f, struct thread, elem)->sleep_ticks;
-	// 	if (th->sleep_ticks <= timer_ticks())
-	// 	{
-	// 		thread_unblock(list_entry(list_pop_front(&sleeping_list), struct thread, elem));
-	// 	}
-	// 	else
-	// 	{
-	// 		break;
-	// 	}
-	// }
-
-	// 드르렁 중인 친구들 수면 시간 체크하고 깨어날 시간이면 깨운다
-	struct list_elem *listE = list_begin(&sleeping_list);
-	while (listE != list_end(&sleeping_list))
-	{
-		struct thread *sleeping_thread = list_entry(listE, struct thread, elem);
-
-		if (sleeping_thread->sleep_ticks <= timer_ticks()) // 깨어날 시간이 되었을 때
-		{
-			listE = list_remove(listE);		 // 현재 요소를 제거하고 다음 요소로 이동
-			thread_unblock(sleeping_thread); // 프로세스 깨운다
-		}
-		else
-		{
-			listE = list_next(listE); // 다음 요소로 이동.
-		}
-	}
-
-	if (thread_mlfqs)
-	{
-		struct list_elem *e;
-		struct thread *t;
-
-		/* 1틱마다 현재 돌고 있는 쓰레드의 recent_cpu 1씩 증가 */
-		thread_current()->recent_cpu = thread_current()->recent_cpu + (1 << 14);
-
-		/* 1초마다 모든 쓰레드의 recent_cpu 갱신 */
-		if (timer_ticks() % TIMER_FREQ == 0)
-		{
-			calculate_ready_thread();
-
-			for (e = list_begin(&all_thread_list); e != list_end(&all_thread_list); e = list_next(e))
-			{
-				t = list_entry(e, struct thread, all_elem);
-				update_recent_cpu(t);
-			}
-		}
-
-		/* 4틱마다 모든 쓰레드 pirority 재계산 */
-		if (timer_ticks() % 4 == 0)
-		{
-			for (e = list_begin(&all_thread_list); e != list_end(&all_thread_list); e = list_next(e))
-			{
-				t = list_entry(e, struct thread, all_elem);
-				t->priority = thread_calculate_priority(t);
+	if(thread_mlfqs){
+		increment_recent_cpu();
+		if(ticks%4 == 0){
+			calc_priority_all();
+			if(ticks % TIMER_FREQ == 0){
+				calc_recent_cpu_all();
+				calc_load_avg();
 			}
 		}
 	}
+
+    struct list_elem *e;
+
+    while (!list_empty(&waiting_list)) {
+        e = list_front(&waiting_list);
+        struct sleep_thread st = *list_entry(e, struct sleep_thread, elem);
+
+        if (st.tick_to_wake_up <= ticks) {
+            list_pop_front(&waiting_list);
+            thread_unblock(st.t);  // 스레드를 직접 깨움
+        } else {
+            break;
+        }
+    }
+
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
    tick, otherwise false. */
-static bool too_many_loops(unsigned loops)
-{
+static bool
+too_many_loops (unsigned loops) {
 	/* Wait for a timer tick. */
 	int64_t start = ticks;
 	while (ticks == start)
-		barrier();
+		barrier ();
 
 	/* Run LOOPS loops. */
 	start = ticks;
-	busy_wait(loops);
+	busy_wait (loops);
 
 	/* If the tick count changed, we iterated too long. */
-	barrier();
+	barrier ();
 	return start != ticks;
 }
 
@@ -235,16 +228,14 @@ static bool too_many_loops(unsigned loops)
    differently in different places the results would be difficult
    to predict. */
 static void NO_INLINE
-busy_wait(int64_t loops)
-{
+busy_wait (int64_t loops) {
 	while (loops-- > 0)
-		barrier();
+		barrier ();
 }
 
 /* Sleep for approximately NUM/DENOM seconds. */
 static void
-real_time_sleep(int64_t num, int32_t denom)
-{
+real_time_sleep (int64_t num, int32_t denom) {
 	/* Convert NUM/DENOM seconds into timer ticks, rounding down.
 
 	   (NUM / DENOM) s
@@ -253,20 +244,17 @@ real_time_sleep(int64_t num, int32_t denom)
 	   */
 	int64_t ticks = num * TIMER_FREQ / denom;
 
-	ASSERT(intr_get_level() == INTR_ON);
-	if (ticks > 0)
-	{
+	ASSERT (intr_get_level () == INTR_ON);
+	if (ticks > 0) {
 		/* We're waiting for at least one full timer tick.  Use
 		   timer_sleep() because it will yield the CPU to other
 		   processes. */
-		timer_sleep(ticks);
-	}
-	else
-	{
+		timer_sleep (ticks);
+	} else {
 		/* Otherwise, use a busy-wait loop for more accurate
 		   sub-tick timing.  We scale the numerator and denominator
 		   down by 1000 to avoid the possibility of overflow. */
-		ASSERT(denom % 1000 == 0);
-		busy_wait(loops_per_tick * num / 1000 * TIMER_FREQ / (denom / 1000));
+		ASSERT (denom % 1000 == 0);
+		busy_wait (loops_per_tick * num / 1000 * TIMER_FREQ / (denom / 1000));
 	}
 }
